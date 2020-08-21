@@ -1,0 +1,115 @@
+#!/usr/bin/stap -g
+// tcpstat(.stp)
+
+%{
+#include <net/tcp.h>
+#include <linux/fdtable.h>
+
+struct result {
+	char laddr[16];
+	char raddr[16];
+	unsigned short	lport;
+	unsigned short	rport;
+	unsigned long	ino;
+	int pid;
+	char comm[32];
+};
+
+static inline void ip2str(char *to, unsigned int from)
+{
+	int size = snprintf(to, 16, "%pI4", &from);
+	to[size] = '\0';
+}
+
+void traverse(struct sock *sk, unsigned long ino, struct result *ret)
+{
+	struct task_struct *tsk;
+	int i;
+
+	for_each_process(tsk) {
+		struct file *file;
+		for (i = 0; i < tsk->files->fdt->max_fds; i++) {
+			file = tsk->files->fdt->fd[i];
+			if (file == NULL) {
+				continue;
+			}
+			if (file->f_inode->i_ino == ino) {
+				char laddr[16], raddr[16];
+
+				ip2str(laddr, inet_sk(sk)->inet_rcv_saddr);
+				ip2str(raddr, inet_sk(sk)->inet_daddr);
+
+				memcpy(&ret->laddr[0], laddr, 16);
+				memcpy(&ret->raddr[0], raddr, 16);
+				ret->lport = sk->sk_num;
+				ret->rport = htons(sk->sk_dport);
+				ret->ino = ino;
+				ret->pid = tsk->pid;
+				memcpy(&ret->comm[0], tsk->comm, 32);
+			}
+		}
+	}
+}
+%}
+
+function dump_tcp_info()
+%{
+	struct task_struct *tsk;
+	struct inet_hashinfo *hashinfo = &tcp_hashinfo;
+	struct hlist_nulls_node *node;
+	struct socket_alloc *sa;
+	struct sock *sk;
+	struct result ret;
+	int i, ino;
+
+	for (i = 0; i < INET_LHTABLE_SIZE; i++) {
+		struct inet_listen_hashbucket *ilb;
+
+		ilb = &hashinfo->listening_hash[i];
+		sk_nulls_for_each(sk, node, &ilb->head) {
+			unsigned long ino;
+
+			sa = (struct socket_alloc *)sk->sk_socket;
+			ino = sa->vfs_inode.i_ino;
+
+			traverse(sk, ino, &ret);
+			STAP_PRINTF("LISTEN %s:%d  inode:%d/[%d] %s\n",
+						ret.laddr,
+						ret.lport,
+						ret.ino,
+						ret.pid,
+						ret.comm);
+		}
+	}
+
+	for (i = 0; i <= hashinfo->ehash_mask; i++) {
+		struct inet_ehash_bucket *head = &hashinfo->ehash[i];
+
+		if (hlist_nulls_empty(&head->chain)) {
+			continue;
+		}
+
+		sk_nulls_for_each(sk, node, &head->chain) {
+			unsigned long ino;
+
+			sa = (struct socket_alloc *)sk->sk_socket;
+			ino = sa->vfs_inode.i_ino;
+
+			traverse(sk, ino, &ret);
+			STAP_PRINTF("ESTABLISHED %s:%d  %s:%d inode:%d/[%d] %s\n",
+						ret.laddr,
+						ret.lport,
+						ret.raddr,
+						ret.rport,
+						ret.ino,
+						ret.pid,
+						ret.comm);
+		}
+	}
+%}
+
+probe begin
+{
+	dump_tcp_info();
+	exit();
+}
